@@ -150,8 +150,9 @@ class NestedLOYOBacktester:
                 continue
 
             expert = TreeExpert(expert_type="seed_baseline")
+            expert.use_feature_subset = False  # Baseline uses all 39 features
             expert.fit(train_fs)
-            preds = expert.predict_proba(test_fs.X)
+            preds = expert.predict_proba(test_fs)
 
             fold_df = test_fs.meta.copy()
             fold_df["p_blend"] = preds

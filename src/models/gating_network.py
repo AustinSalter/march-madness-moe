@@ -12,16 +12,23 @@ from torch.utils.data import DataLoader, TensorDataset
 from src.config import (
     GATING_BATCH_SIZE,
     GATING_DROPOUT,
+    GATING_ENTROPY_LAMBDA,
     GATING_EPOCHS,
     GATING_HIDDEN_SIZES,
     GATING_LR,
+    GATING_MIN_WEIGHT,
 )
 
 logger = logging.getLogger(__name__)
 
 
 class GatingMLP(nn.Module):
-    """Raw MLP: context features → expert weights via softmax."""
+    """Raw MLP: context features → expert weights via softmax.
+
+    When min_weight > 0, raw softmax weights are clamped to [min_weight, 1.0]
+    and renormalized so they sum to 1. This prevents gating collapse where
+    a single expert absorbs all weight.
+    """
 
     def __init__(
         self,
@@ -29,8 +36,10 @@ class GatingMLP(nn.Module):
         n_experts: int = 3,
         hidden_sizes: list[int] | None = None,
         dropout: float = GATING_DROPOUT,
+        min_weight: float = GATING_MIN_WEIGHT,
     ):
         super().__init__()
+        self.min_weight = min_weight
         hidden_sizes = hidden_sizes or GATING_HIDDEN_SIZES
         layers = []
         prev_dim = input_dim
@@ -45,8 +54,12 @@ class GatingMLP(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return softmax expert weights (n, n_experts)."""
-        return torch.softmax(self.net(x), dim=1)
+        """Return expert weights (n, n_experts) with optional minimum floor."""
+        weights = torch.softmax(self.net(x), dim=1)
+        if self.min_weight > 0:
+            weights = torch.clamp(weights, min=self.min_weight)
+            weights = weights / weights.sum(dim=1, keepdim=True)
+        return weights
 
 
 class GatingNetwork:
@@ -64,13 +77,17 @@ class GatingNetwork:
         lr: float = GATING_LR,
         epochs: int = GATING_EPOCHS,
         batch_size: int = GATING_BATCH_SIZE,
+        min_weight: float = GATING_MIN_WEIGHT,
+        entropy_lambda: float = GATING_ENTROPY_LAMBDA,
     ):
         self.input_dim = input_dim
         self.n_experts = n_experts
         self.lr = lr
         self.epochs = epochs
         self.batch_size = batch_size
-        self.mlp = GatingMLP(input_dim, n_experts)
+        self.min_weight = min_weight
+        self.entropy_lambda = entropy_lambda
+        self.mlp = GatingMLP(input_dim, n_experts, min_weight=min_weight)
         self.device = torch.device("cpu")
         self._fitted = False
 
@@ -94,6 +111,10 @@ class GatingNetwork:
         Returns:
             self
         """
+        # Fill NaN in gating features (e.g. luck_delta for early seasons)
+        context_X = np.nan_to_num(np.asarray(context_X, dtype=np.float32), nan=0.0)
+        expert_preds = np.nan_to_num(np.asarray(expert_preds, dtype=np.float32), nan=0.5)
+
         n = len(y)
         idx = np.random.RandomState(42).permutation(n)
         val_size = int(n * val_fraction)
@@ -120,6 +141,10 @@ class GatingNetwork:
         best_state = None
         wait = 0
 
+        def _entropy(w: torch.Tensor) -> torch.Tensor:
+            """Mean entropy of weight distributions: -sum(w * log(w)) per sample."""
+            return -(w * torch.log(w + 1e-8)).sum(dim=1).mean()
+
         for epoch in range(self.epochs):
             # Train
             self.mlp.train()
@@ -127,18 +152,23 @@ class GatingNetwork:
                 weights = self.mlp(ctx_b)  # (batch, n_experts)
                 blended = (weights * ep_b).sum(dim=1, keepdim=True)  # (batch, 1)
                 blended = blended.clamp(1e-7, 1 - 1e-7)
-                loss = loss_fn(blended, y_b)
+                bce_loss = loss_fn(blended, y_b)
+                # Entropy bonus: reward spreading weight across experts
+                entropy_bonus = _entropy(weights)
+                loss = bce_loss - self.entropy_lambda * entropy_bonus
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-            # Validate
+            # Validate (use same combined loss for early stopping)
             self.mlp.eval()
             with torch.no_grad():
                 val_weights = self.mlp(ctx_val)
                 val_blended = (val_weights * ep_val).sum(dim=1, keepdim=True)
                 val_blended = val_blended.clamp(1e-7, 1 - 1e-7)
-                val_loss = loss_fn(val_blended, y_val).item()
+                val_bce = loss_fn(val_blended, y_val).item()
+                val_entropy = _entropy(val_weights).item()
+                val_loss = val_bce - self.entropy_lambda * val_entropy
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -174,7 +204,8 @@ class GatingNetwork:
 
         self.mlp.eval()
         with torch.no_grad():
-            ctx = torch.tensor(np.asarray(context_X), dtype=torch.float32).to(self.device)
+            ctx_arr = np.nan_to_num(np.asarray(context_X, dtype=np.float32), nan=0.0)
+            ctx = torch.tensor(ctx_arr, dtype=torch.float32).to(self.device)
             weights = self.mlp(ctx).cpu().numpy()
         return weights
 
@@ -188,6 +219,8 @@ class GatingNetwork:
             "lr": self.lr,
             "epochs": self.epochs,
             "batch_size": self.batch_size,
+            "min_weight": self.min_weight,
+            "entropy_lambda": self.entropy_lambda,
             "mlp_state_dict": self.mlp.state_dict(),
             "fitted": self._fitted,
         }
@@ -206,6 +239,8 @@ class GatingNetwork:
             lr=state["lr"],
             epochs=state["epochs"],
             batch_size=state["batch_size"],
+            min_weight=state.get("min_weight", 0.0),
+            entropy_lambda=state.get("entropy_lambda", 0.0),
         )
         gn.mlp.load_state_dict(state["mlp_state_dict"])
         gn._fitted = state["fitted"]

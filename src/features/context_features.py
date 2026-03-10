@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from src.config import TOURNAMENT_DIR
@@ -53,6 +54,28 @@ def _load_conferences(
         logger.warning("MTeamConferences.csv not found at %s", conf_path)
         return pd.DataFrame()
     return pd.read_csv(conf_path)
+
+
+# Standard NCAA bracket slot assignment (seed -> 1-indexed position in 16-team region)
+_SEED_TO_SLOT = {
+    1: 1, 16: 2, 8: 3, 9: 4, 5: 5, 12: 6, 4: 7, 13: 8,
+    6: 9, 11: 10, 3: 11, 14: 12, 7: 13, 10: 14, 2: 15, 15: 16,
+}
+
+
+def _compute_chalk_round(seed_a: int, seed_b: int) -> int:
+    """Earliest tournament round two seeds would meet if the bracket held to chalk.
+
+    Returns 5 for cross-region matchups (Final Four+) or unrecognized seeds.
+    """
+    if seed_a not in _SEED_TO_SLOT or seed_b not in _SEED_TO_SLOT:
+        return 5
+    slot_a = _SEED_TO_SLOT[seed_a] - 1  # 0-indexed
+    slot_b = _SEED_TO_SLOT[seed_b] - 1
+    for r in range(1, 5):
+        if slot_a // (2 ** r) == slot_b // (2 ** r):
+            return r
+    return 5
 
 
 def add_context_features(
@@ -124,6 +147,21 @@ def add_context_features(
         out["hist_upset_rate"] = out.apply(_get_upset_rate, axis=1)
     else:
         out["hist_upset_rate"] = float("nan")
+
+    # higher_seed: the favorite's actual seed number
+    out["higher_seed"] = out["seed_a"]
+
+    # seed_sum: total seeds in matchup (bracket position proxy)
+    out["seed_sum"] = out["seed_a"] + out["seed_b"]
+
+    # log_seed_ratio: log(underdog / favorite) — multiplicative mismatch
+    out["log_seed_ratio"] = np.log(out["seed_b"] / out["seed_a"])
+
+    # chalk_round: earliest round this matchup would occur under chalk bracket
+    out["chalk_round"] = out.apply(
+        lambda row: _compute_chalk_round(int(row["seed_a"]), int(row["seed_b"])),
+        axis=1,
+    )
 
     n_same_conf = out["same_conf"].sum()
     logger.info(

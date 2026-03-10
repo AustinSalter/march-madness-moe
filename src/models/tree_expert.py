@@ -13,6 +13,8 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from src.config import (
     EARLY_STOPPING_ROUNDS,
     EFFICIENCY_WEIGHT_FLOOR,
+    EXPERT_FEATURE_SUBSETS,
+    EXPERT_RANKING_TARGET,
     EXPERT_TYPES,
     OPTUNA_N_TRIALS,
     OPTUNA_SEARCH_SPACE,
@@ -40,6 +42,43 @@ class TreeExpert:
         self.model: xgb.XGBClassifier | None = None
         self.calibrator: CalibratedClassifierCV | None = None
         self._is_calibrated = False
+        self.feature_columns: list[str] | None = None
+        self.use_feature_subset: bool = True
+
+    def _prepare_X(self, X: pd.DataFrame, ranking_targets: pd.DataFrame | None = None) -> pd.DataFrame:
+        """Inject ranking target and apply feature subsetting.
+
+        First call (feature_columns is None) resolves the config subset.
+        Subsequent calls reuse the stored feature_columns list.
+        """
+        # Step 1: Inject ranking target column if available
+        target_col = EXPERT_RANKING_TARGET.get(self.expert_type)
+        if target_col and ranking_targets is not None and target_col in ranking_targets.columns:
+            if target_col not in X.columns:
+                X = X.copy()
+                X[target_col] = ranking_targets[target_col].values
+
+        # Step 2: Apply feature subsetting
+        if self.feature_columns is not None:
+            return X[self.feature_columns]
+
+        if not self.use_feature_subset:
+            self.feature_columns = list(X.columns)
+            return X
+
+        configured = EXPERT_FEATURE_SUBSETS.get(self.expert_type)
+        if configured is None:
+            self.feature_columns = list(X.columns)
+            return X
+
+        available = [c for c in configured if c in X.columns]
+        if not available:
+            logger.warning("%s: no configured features found — using all", self.expert_type)
+            self.feature_columns = list(X.columns)
+            return X
+
+        self.feature_columns = available
+        return X[available]
 
     def compute_sample_weights(self, fs: FeatureSet) -> np.ndarray:
         """Compute per-sample weights based on expert type.
@@ -56,24 +95,25 @@ class TreeExpert:
             return np.ones(n)
 
         elif self.expert_type == "efficiency_delta":
-            if "adjem_delta" not in fs.X.columns:
-                logger.warning("adjem_delta not in X — using uniform weights")
+            weight_col = "net_rating_delta"
+            if weight_col not in fs.X.columns:
+                weight_col = "adjem_delta"  # fallback
+            if weight_col not in fs.X.columns:
+                logger.warning("No efficiency weighting column — using uniform")
                 return np.ones(n)
-            w = fs.X["adjem_delta"].abs().values.copy()
+            w = fs.X[weight_col].abs().values.copy()
+            w = np.nan_to_num(w, nan=0.0)
             w = np.maximum(w, EFFICIENCY_WEIGHT_FLOOR)
             w = w * (n / w.sum())
             return w
 
         elif self.expert_type == "uncertainty_calibration":
+            # 1/|seed_diff| — focus on close games where uncertainty matters most
             if "seed_diff" not in fs.X.columns:
-                logger.warning("seed_diff not in X — using uniform weights")
                 return np.ones(n)
             seed_diff = fs.X["seed_diff"].abs().values.astype(float)
-            eps = 1.0
-            w = 1.0 / (seed_diff + eps)
-            # Same-seed matchups (seed_diff == 0) get boosted weight
-            same_seed = seed_diff == 0
-            w[same_seed] = UNCERTAINTY_SAME_SEED_WEIGHT
+            w = 1.0 / (seed_diff + 1.0)
+            w[seed_diff == 0] = UNCERTAINTY_SAME_SEED_WEIGHT
             w = w * (n / w.sum())
             return w
 
@@ -94,6 +134,11 @@ class TreeExpert:
             self
         """
         weights = self.compute_sample_weights(fs)
+        X_train = self._prepare_X(fs.X, fs.ranking_targets)  # Sets self.feature_columns on first call
+
+        # Auto-adjust colsample_bytree for small feature sets
+        if len(self.feature_columns) <= 6:
+            self.params["colsample_bytree"] = 1.0
 
         # Prepare params for XGBClassifier
         fit_params = {**self.params}
@@ -109,33 +154,30 @@ class TreeExpert:
 
         if val_fs is not None:
             val_weights = self.compute_sample_weights(val_fs)
+            X_val = self._prepare_X(val_fs.X, val_fs.ranking_targets)
             self.model.fit(
-                fs.X, fs.y,
+                X_train, fs.y,
                 sample_weight=weights,
-                eval_set=[(val_fs.X, val_fs.y)],
+                eval_set=[(X_val, val_fs.y)],
                 sample_weight_eval_set=[val_weights],
                 verbose=False,
             )
         else:
             # 80/20 stratified split for early stopping
             sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-            train_idx, val_idx = next(sss.split(fs.X, fs.y))
-            X_train, X_val = fs.X.iloc[train_idx], fs.X.iloc[val_idx]
-            y_train, y_val = fs.y.iloc[train_idx], fs.y.iloc[val_idx]
-            w_train, w_val = weights[train_idx], weights[val_idx]
-
+            train_idx, val_idx = next(sss.split(X_train, fs.y))
             self.model.fit(
-                X_train, y_train,
-                sample_weight=w_train,
-                eval_set=[(X_val, y_val)],
-                sample_weight_eval_set=[w_val],
+                X_train.iloc[train_idx], fs.y.iloc[train_idx],
+                sample_weight=weights[train_idx],
+                eval_set=[(X_train.iloc[val_idx], fs.y.iloc[val_idx])],
+                sample_weight_eval_set=[weights[val_idx]],
                 verbose=False,
             )
 
         best_iter = getattr(self.model, "best_iteration", None)
         logger.info(
             "Trained %s expert: best_iteration=%s, n_features=%d, n_samples=%d",
-            self.expert_type, best_iter, fs.X.shape[1], fs.X.shape[0],
+            self.expert_type, best_iter, len(self.feature_columns), fs.X.shape[0],
         )
         return self
 
@@ -164,19 +206,20 @@ class TreeExpert:
             cv=cv,
         )
         weights = self.compute_sample_weights(fs)
-        self.calibrator.fit(fs.X, fs.y, sample_weight=weights)
+        X_cal = self._prepare_X(fs.X, fs.ranking_targets)
+        self.calibrator.fit(X_cal, fs.y, sample_weight=weights)
         self._is_calibrated = True
 
         logger.info("Calibrated %s expert with method=%s, cv=%d", self.expert_type, method, cv)
         return self
 
-    def predict_proba(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: "pd.DataFrame | np.ndarray | FeatureSet") -> np.ndarray:
         """Return 1-D P(higher_seed_wins).
 
         Uses calibrator if fitted, otherwise raw model.
 
         Args:
-            X: Feature matrix.
+            X: Feature matrix or FeatureSet.
 
         Returns:
             1-D array of probabilities.
@@ -184,10 +227,23 @@ class TreeExpert:
         if self.model is None:
             raise RuntimeError("Must fit() before predict_proba()")
 
-        if self._is_calibrated and self.calibrator is not None:
-            proba = self.calibrator.predict_proba(X)
+        if isinstance(X, FeatureSet):
+            X_input = self._prepare_X(X.X, X.ranking_targets)
+        elif self.feature_columns is not None and isinstance(X, pd.DataFrame):
+            missing = [c for c in self.feature_columns if c not in X.columns]
+            if missing:
+                raise ValueError(
+                    f"Raw DataFrame is missing columns {missing} that were injected from "
+                    f"ranking_targets during fit(). Pass the full FeatureSet instead of .X"
+                )
+            X_input = X[self.feature_columns]
         else:
-            proba = self.model.predict_proba(X)
+            X_input = X
+
+        if self._is_calibrated and self.calibrator is not None:
+            proba = self.calibrator.predict_proba(X_input)
+        else:
+            proba = self.model.predict_proba(X_input)
 
         # Return probability of class 1 (higher_seed_wins)
         return proba[:, 1]
@@ -219,6 +275,11 @@ class TreeExpert:
             expert = pickle.load(f)
         if not isinstance(expert, cls):
             raise TypeError(f"Expected TreeExpert, got {type(expert)}")
+        # Pickle compat for models saved before feature subsetting
+        if not hasattr(expert, "feature_columns"):
+            expert.feature_columns = None
+        if not hasattr(expert, "use_feature_subset"):
+            expert.use_feature_subset = True
         logger.info("Loaded %s expert from %s", expert.expert_type, path)
         return expert
 
@@ -250,14 +311,17 @@ def tune_expert_hyperparams(
     # Prepare train/val split if no val_fs
     dummy_expert = TreeExpert(expert_type=expert_type)
     weights = dummy_expert.compute_sample_weights(fs)
+    X_full = dummy_expert._prepare_X(fs.X, fs.ranking_targets)
+    feature_cols = dummy_expert.feature_columns
 
     if val_fs is not None:
-        X_train, y_train, w_train = fs.X, fs.y, weights
-        X_val, y_val = val_fs.X, val_fs.y
+        X_train, y_train, w_train = X_full, fs.y, weights
+        X_val_full = dummy_expert._prepare_X(val_fs.X, val_fs.ranking_targets)
+        X_val, y_val = X_val_full, val_fs.y
     else:
         sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-        train_idx, val_idx = next(sss.split(fs.X, fs.y))
-        X_train, X_val = fs.X.iloc[train_idx], fs.X.iloc[val_idx]
+        train_idx, val_idx = next(sss.split(X_full, fs.y))
+        X_train, X_val = X_full.iloc[train_idx], X_full.iloc[val_idx]
         y_train, y_val = fs.y.iloc[train_idx], fs.y.iloc[val_idx]
         w_train = weights[train_idx]
 

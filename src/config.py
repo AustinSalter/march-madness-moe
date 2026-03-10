@@ -41,6 +41,39 @@ EXPERT_TYPES = ["seed_baseline", "efficiency_delta", "uncertainty_calibration"]
 EFFICIENCY_WEIGHT_FLOOR = 0.1
 UNCERTAINTY_SAME_SEED_WEIGHT = 5.0
 
+EXPERT_FEATURE_SUBSETS: dict[str, list[str] | None] = {
+    "seed_baseline": [
+        "seed_diff", "hist_upset_rate", "round", "same_conf",
+        "adjem_delta", "net_rating_delta", "expected_margin",
+        "higher_seed", "seed_sum", "log_seed_ratio", "chalk_round",
+        "seed_implied_prob",           # ranking target as feature
+    ],
+    "efficiency_delta": [
+        "adjem_delta", "adjoe_delta", "adjde_delta", "adjtempo_delta",
+        "net_rating_delta", "expected_margin",
+        "off_efgpct_delta", "off_topct_delta", "off_orpct_delta", "off_ftrate_delta",
+        "off_fg2pct_delta", "off_fg3pct_delta", "off_ftpct_delta",
+        "off_blockpct_delta", "off_arate_delta", "off_fg3rate_delta",
+        "off_stlrate_delta", "off_nstrate_delta",
+        "def_fg2pct_delta", "def_fg3pct_delta", "def_ftpct_delta",
+        "def_blockpct_delta", "def_arate_delta", "def_fg3rate_delta",
+        "def_stlrate_delta", "def_nstrate_delta",
+        "efficiency_delta_rank",       # Change 4: ranking target as feature
+    ],
+    "uncertainty_calibration": [
+        "luck_delta", "sos_adjem_delta", "sos_opp_o_delta", "sos_opp_d_delta",
+        "ncsos_adjem_delta", "experience_delta", "avg_height_delta",
+        "eff_height_delta", "bench_delta", "seed_diff", "round", "adjtempo_delta",
+        "game_certainty_score",        # Change 4: ranking target as feature
+    ],
+}
+
+EXPERT_RANKING_TARGET: dict[str, str] = {
+    "seed_baseline": "seed_implied_prob",
+    "efficiency_delta": "efficiency_delta_rank",
+    "uncertainty_calibration": "game_certainty_score",
+}
+
 # ── Optuna hyperparameter tuning ─────────────────────────────────────────
 OPTUNA_N_TRIALS = 50
 OPTUNA_TIMEOUT = 600
@@ -63,6 +96,8 @@ GATING_DROPOUT = 0.2
 GATING_LR = 1e-3
 GATING_EPOCHS = 200
 GATING_BATCH_SIZE = 64
+GATING_MIN_WEIGHT = 0.15  # Floor per expert — prevents gating collapse
+GATING_ENTROPY_LAMBDA = 0.30  # Reward for spreading weight across experts
 
 # ── Multi-task expert defaults (Tier 2 / stretch) ────────────────────────
 BACKBONE_HIDDEN_SIZES = [32, 24]

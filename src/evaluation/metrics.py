@@ -10,8 +10,9 @@ from src.config import ESPN_ROUND_POINTS
 
 def compute_logloss(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Compute log-loss with clipping to avoid log(0)."""
-    y_pred = np.clip(y_pred, 1e-15, 1 - 1e-15)
-    return log_loss(y_true, y_pred)
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.clip(np.asarray(y_pred, dtype=float), 1e-15, 1 - 1e-15)
+    return -float(np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred)))
 
 
 def compute_accuracy(

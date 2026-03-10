@@ -135,6 +135,66 @@ EARLY_STOPPING_ROUNDS = 50
 
 ---
 
+## Simulation Layer (Level 4)
+
+### Implemented Files
+
+| # | File | Lines | Description |
+|---|------|-------|-------------|
+| 13 | **`src/bracket/structure.py`** | ~160 | `Bracket`, `BracketSlot` dataclasses; `load_bracket()` parses `MNCAATourneySlots.csv`; play-in (First Four) support with a/b seed suffixes; template fallback for seasons not in CSV |
+| 14 | **`src/simulation/matchup_builder.py`** | ~190 | `TeamStatsLookup` — maps team_id to KenPom stats, builds hypothetical matchup DataFrames, runs through full feature pipeline (deltas, context, ranking targets, partition), orients P(higher_seed_wins) to P(team_a_wins) |
+| 15 | **`src/simulation/log5.py`** | ~80 | `log5_win_probability()` (Bill James formula) + `build_log5_win_prob_fn()` closure from regular-season win records |
+| 16 | **`src/simulation/mc_engine.py`** | ~220 | `MCSimulator` — pre-generates random draws, resolves bracket graph in round order, caches unique matchup probabilities, aggregates advancement probs + EV bracket + championship odds |
+| 17 | **`src/bracket/predictor.py`** | ~240 | `BracketPredictor` orchestrator — loads bracket, builds `TeamStatsLookup`, wraps MOE into `win_prob_fn`, runs MC, extracts picks/champion/final four/R1 expert decomposition |
+| 18 | **`src/bracket/visualizer.py`** | ~210 | Console rendering: `print_bracket()`, `print_advancement_table()`, `print_champion_probabilities()`, `print_final_four()`, `print_round1_decomposition()` |
+| 19 | **`scripts/predict_bracket.py`** | ~140 | CLI entry point: `--season`, `--model-dir`, `--n-sims`, `--seed`, `--log5-baseline`, `--historical`, `--top-n` |
+
+### Simulation Architecture
+
+```
+load_bracket(season)
+        |
+TeamStatsLookup(season, kenpom_df, upset_rate_lookup)
+        |
+        |   For each hypothetical matchup (team_a, team_b, round):
+        |     1. Orient higher seed as team_a
+        |     2. Build 1-row DataFrame (mimics merge.py output)
+        |     3. compute_deltas() -> add_context_features() -> compute_ranking_targets()
+        |     4. _partition() -> FeatureSet
+        |     5. MOE.predict_proba() -> P(higher_seed_wins)
+        |     6. Orient to P(team_a_wins)
+        |
+MCSimulator(n_sims=10,000)
+        |
+        |   For each simulation:
+        |     Resolve play-in (round 0) -> R1 -> R2 -> ... -> R6
+        |     Bernoulli draw at each game using cached win probs
+        |
+SimulationResult
+        |
+        ├── advancement_probs: team_id -> {round -> P(advance)}
+        ├── championship_probs: team_id -> P(champion)
+        ├── ev_bracket: most-likely winner at each slot
+        └── slot_results: slot -> {team_id -> win_count}
+```
+
+### Key Design Decisions
+
+- **Play-in games**: Raw seed strings with a/b suffixes preserved (`W16a`, `W16b`). `_resolve_team()` checks simulation winners dict before bracket.teams to handle play-in slot names (`W16`) that look like seed references.
+- **Probability orientation**: MOE returns P(higher_seed_wins). `TeamStatsLookup.get_win_prob()` centralizes the conversion to P(team_a_wins) regardless of which team is higher seeded.
+- **MC probability caching**: Cache key = `(min(id_a, id_b), max(id_a, id_b), round)` storing P(lower_id wins). ~300-400 unique matchups across 10K sims (R1 is fixed, later rounds vary).
+- **Template bracket**: For seasons not in `MNCAATourneySlots.csv` (2024+), uses most recent available season's slot structure — bracket topology is identical year-to-year.
+- **Gating NaN safety**: `fillna(0)` applied to gating features for hypothetical matchups where luck_delta may be NaN.
+
+### Sanity Checks
+
+- 63 tournament slots + 4 play-in slots = 67 total (verified)
+- Championship probabilities sum to 1.0 (verified)
+- All slots produce results in MC simulation (verified)
+- R1 seed pairings correct: 1v16, 2v15, ..., 8v9 per region (verified)
+
+---
+
 ## Usage
 
 ```bash
@@ -149,4 +209,13 @@ python scripts/train_experts.py
 
 # Run full backtest (baseline + MOE comparison)
 python scripts/run_backtest.py
+
+# Generate bracket prediction (historical season)
+python scripts/predict_bracket.py --season 2025 --historical
+
+# Generate bracket with Log5 comparison
+python scripts/predict_bracket.py --season 2025 --historical --log5-baseline
+
+# Generate bracket for future season (requires scraped KenPom data)
+python scripts/predict_bracket.py --season 2026 --n-sims 50000
 ```

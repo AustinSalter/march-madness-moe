@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
 
 from src.config import EXPERT_TYPES, FIRST_YEAR, LAST_YEAR, SKIP_YEARS
 from src.features.pipeline import FeatureSet, build_features_for_split
@@ -27,6 +28,7 @@ class MOEEnsemble:
         self.expert_params = expert_params or {}
         self.experts: dict[str, TreeExpert] = {}
         self.gating: GatingNetwork | None = None
+        self.blend_calibrator: IsotonicRegression | None = None
 
     def train_experts(
         self,
@@ -60,23 +62,40 @@ class MOEEnsemble:
 
         preds = []
         for expert_type in EXPERT_TYPES:
-            p = self.experts[expert_type].predict_proba(fs.X)
+            p = self.experts[expert_type].predict_proba(fs)
             preds.append(p)
         return np.column_stack(preds)
 
     def _get_gating_features(self, fs: FeatureSet) -> np.ndarray:
-        """Extract gating features from FeatureSet.
+        """Extract gating features from FeatureSet, one-hot encoding round.
+
+        Raw round (1-6) is replaced with 6 binary indicators so the gating
+        network can learn round-specific expert routing without needing to
+        discover nonlinear thresholds on a single low-magnitude integer.
 
         Args:
             fs: FeatureSet.
 
         Returns:
-            (n, n_gating_features) array.
+            (n, n_gating_features) array.  With round one-hot: 9 columns.
         """
         gating_cols = fs.gating_features
         if not gating_cols:
             raise ValueError("No gating features found in FeatureSet")
-        return fs.X[gating_cols].values
+
+        raw = fs.X[gating_cols].values.copy()
+
+        if "round" in gating_cols:
+            round_idx = gating_cols.index("round")
+            rounds = raw[:, round_idx].astype(int)
+            other = np.delete(raw, round_idx, axis=1)
+            # One-hot encode rounds 1-6
+            round_oh = np.zeros((len(rounds), 6), dtype=np.float32)
+            for r in range(1, 7):
+                round_oh[:, r - 1] = (rounds == r).astype(np.float32)
+            return np.hstack([other, round_oh])
+
+        return raw
 
     def train_gating(
         self,
@@ -95,8 +114,17 @@ class MOEEnsemble:
         self.gating = GatingNetwork(input_dim=input_dim, n_experts=len(EXPERT_TYPES))
         self.gating.fit(context_X, expert_preds, y)
 
+        # Post-hoc isotonic calibration on inner-CV blended predictions
+        weights = self.gating.predict_weights(context_X)
+        blended = (weights * expert_preds).sum(axis=1)
+        self.blend_calibrator = IsotonicRegression(
+            y_min=0.01, y_max=0.99, out_of_bounds="clip",
+        )
+        self.blend_calibrator.fit(blended, y)
+        logger.info("Fitted blend isotonic calibrator on %d inner-CV predictions", len(y))
+
     def predict_proba(self, fs: FeatureSet) -> np.ndarray:
-        """Blended prediction: P = w1*P1 + w2*P2 + w3*P3.
+        """Blended prediction: P = w1*P1 + w2*P2 + w3*P3, then isotonic calibration.
 
         Args:
             fs: FeatureSet to predict on.
@@ -114,6 +142,10 @@ class MOEEnsemble:
             weights = np.ones_like(expert_preds) / expert_preds.shape[1]
 
         blended = (weights * expert_preds).sum(axis=1)
+
+        if self.blend_calibrator is not None:
+            blended = self.blend_calibrator.predict(blended)
+
         return blended
 
     def predict_decomposed(self, fs: FeatureSet) -> pd.DataFrame:
@@ -123,7 +155,8 @@ class MOEEnsemble:
             fs: FeatureSet to predict on.
 
         Returns:
-            DataFrame with columns: p_seed, p_eff, p_unc, w_seed, w_eff, w_unc, p_blend.
+            DataFrame with columns: p_seed, p_eff, p_unc, w_seed, w_eff, w_unc,
+            p_blend_raw, p_blend.
         """
         expert_preds = self.get_expert_predictions(fs)
 
@@ -133,7 +166,10 @@ class MOEEnsemble:
         else:
             weights = np.ones_like(expert_preds) / expert_preds.shape[1]
 
-        blended = (weights * expert_preds).sum(axis=1)
+        blended_raw = (weights * expert_preds).sum(axis=1)
+        blended = blended_raw.copy()
+        if self.blend_calibrator is not None:
+            blended = self.blend_calibrator.predict(blended)
 
         return pd.DataFrame({
             "p_seed": expert_preds[:, 0],
@@ -142,6 +178,7 @@ class MOEEnsemble:
             "w_seed": weights[:, 0],
             "w_eff": weights[:, 1],
             "w_unc": weights[:, 2],
+            "p_blend_raw": blended_raw,
             "p_blend": blended,
         }, index=fs.X.index)
 
@@ -185,13 +222,12 @@ class MOEEnsemble:
             # Predict on inner validation set
             preds = []
             for expert_type in EXPERT_TYPES:
-                p = inner_experts[expert_type].predict_proba(inner_val_fs.X)
+                p = inner_experts[expert_type].predict_proba(inner_val_fs)
                 preds.append(p)
             expert_preds = np.column_stack(preds)
 
-            # Extract gating features
-            gating_cols = inner_val_fs.gating_features
-            context = inner_val_fs.X[gating_cols].values
+            # Extract gating features (with one-hot round encoding)
+            context = self._get_gating_features(inner_val_fs)
 
             all_context.append(context)
             all_expert_preds.append(expert_preds)
@@ -257,6 +293,10 @@ class MOEEnsemble:
         if self.gating is not None:
             self.gating.save(dir_path / "gating_network.pkl")
 
+        if self.blend_calibrator is not None:
+            with open(dir_path / "blend_calibrator.pkl", "wb") as f:
+                pickle.dump(self.blend_calibrator, f)
+
         # Save metadata
         meta = {"expert_params": self.expert_params}
         with open(dir_path / "moe_meta.pkl", "wb") as f:
@@ -292,6 +332,12 @@ class MOEEnsemble:
         gating_path = dir_path / "gating_network.pkl"
         if gating_path.exists():
             moe.gating = GatingNetwork.load(gating_path)
+
+        # Load blend calibrator
+        cal_path = dir_path / "blend_calibrator.pkl"
+        if cal_path.exists():
+            with open(cal_path, "rb") as f:
+                moe.blend_calibrator = pickle.load(f)
 
         logger.info("Loaded MOEEnsemble from %s", dir_path)
         return moe
