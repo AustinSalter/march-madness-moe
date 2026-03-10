@@ -1,0 +1,1 @@
+"""Bracket rendering and visualization."""
