@@ -10,7 +10,7 @@ A Mixture of Experts prediction system for the NCAA March Madness tournament. Th
                     +--------------+--------------+
                     |              |              |
               Seed Baseline   Efficiency    Uncertainty
-              (5 features)    (27 features)  (13 features)
+              (12 features)   (25 features)  (13 features)
               uniform wt.     |AdjEM| wt.   1/|seed_diff| wt.
                     |              |              |
                     +------+-------+------+------+
